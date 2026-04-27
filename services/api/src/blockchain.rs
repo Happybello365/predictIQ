@@ -40,6 +40,20 @@ struct MonitoringState {
     watched_txs: RwLock<HashSet<String>>,
 }
 
+/// Indicates whether a response was sourced from a live RPC call or a stale
+/// cache entry served after an RPC failure.
+///
+/// Consumers and alerting rules can use this field to distinguish real zeros
+/// from error-masked defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataSource {
+    /// Data was fetched live from the RPC node.
+    Live,
+    /// The RPC call failed; this is a stale cached value served as a fallback.
+    StaleFallback,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainMarketData {
     pub market_id: i64,
@@ -48,6 +62,7 @@ pub struct ChainMarketData {
     pub onchain_volume: String,
     pub resolved_outcome: Option<u32>,
     pub ledger: u32,
+    pub source: DataSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +72,7 @@ pub struct PlatformStatistics {
     pub resolved_markets: u64,
     pub total_volume: String,
     pub ledger: u32,
+    pub source: DataSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,15 +91,17 @@ pub struct UserBetsPage {
     pub page_size: i64,
     pub total: i64,
     pub items: Vec<UserBet>,
+    pub source: DataSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OracleResult {
     pub market_id: i64,
-    pub source: Option<String>,
+    pub source_name: Option<String>,
     pub outcome: Option<u32>,
     pub confidence_bps: Option<u64>,
     pub ledger: u32,
+    pub source: DataSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +110,7 @@ pub struct TransactionStatus {
     pub status: String,
     pub ledger: Option<u32>,
     pub error: Option<String>,
+    pub source: DataSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,8 +296,8 @@ impl BlockchainClient {
             .cache
             .get_or_set_json(&key, ttl, || async move {
                 let ledger = self.latest_ledger().await.unwrap_or(0);
-                let data: Value = self
-                    .rpc_call(
+                match self
+                    .rpc_call::<Value>(
                         "getContractData",
                         json!({
                             "contractId": self.contract_id,
@@ -286,36 +305,30 @@ impl BlockchainClient {
                         }),
                     )
                     .await
-                    .unwrap_or_else(|_| {
-                        json!({
-                            "title": null,
-                            "status": null,
-                            "onchain_volume": "0",
-                            "resolved_outcome": null
-                        })
-                    });
-
-                Ok(ChainMarketData {
-                    market_id,
-                    title: data
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    status: data
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    onchain_volume: data
-                        .get("onchain_volume")
-                        .and_then(Value::as_str)
-                        .unwrap_or("0")
-                        .to_string(),
-                    resolved_outcome: data
-                        .get("resolved_outcome")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as u32),
-                    ledger,
-                })
+                {
+                    Ok(data) => Ok(ChainMarketData {
+                        market_id,
+                        title: data.get("title").and_then(Value::as_str).map(ToOwned::to_owned),
+                        status: data.get("status").and_then(Value::as_str).map(ToOwned::to_owned),
+                        onchain_volume: data
+                            .get("onchain_volume")
+                            .and_then(Value::as_str)
+                            .unwrap_or("0")
+                            .to_string(),
+                        resolved_outcome: data
+                            .get("resolved_outcome")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32),
+                        ledger,
+                        source: DataSource::Live,
+                    }),
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getContractData");
+                        self.metrics.observe_rpc_fallback(endpoint);
+                        tracing::warn!(market_id, error = %e, "market_data RPC failed");
+                        Err(e)
+                    }
+                }
             })
             .await?;
 
@@ -337,8 +350,8 @@ impl BlockchainClient {
             .cache
             .get_or_set_json(&key, ttl, || async move {
                 let ledger = self.latest_ledger().await.unwrap_or(0);
-                let data: Value = self
-                    .rpc_call(
+                match self
+                    .rpc_call::<Value>(
                         "getContractData",
                         json!({
                             "contractId": self.contract_id,
@@ -346,35 +359,26 @@ impl BlockchainClient {
                         }),
                     )
                     .await
-                    .unwrap_or_else(|_| {
-                        json!({
-                            "total_markets": 0,
-                            "active_markets": 0,
-                            "resolved_markets": 0,
-                            "total_volume": "0"
-                        })
-                    });
-
-                Ok(PlatformStatistics {
-                    total_markets: data
-                        .get("total_markets")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    active_markets: data
-                        .get("active_markets")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    resolved_markets: data
-                        .get("resolved_markets")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    total_volume: data
-                        .get("total_volume")
-                        .and_then(Value::as_str)
-                        .unwrap_or("0")
-                        .to_string(),
-                    ledger,
-                })
+                {
+                    Ok(data) => Ok(PlatformStatistics {
+                        total_markets: data.get("total_markets").and_then(Value::as_u64).unwrap_or(0),
+                        active_markets: data.get("active_markets").and_then(Value::as_u64).unwrap_or(0),
+                        resolved_markets: data.get("resolved_markets").and_then(Value::as_u64).unwrap_or(0),
+                        total_volume: data
+                            .get("total_volume")
+                            .and_then(Value::as_str)
+                            .unwrap_or("0")
+                            .to_string(),
+                        ledger,
+                        source: DataSource::Live,
+                    }),
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getContractData");
+                        self.metrics.observe_rpc_fallback(endpoint);
+                        tracing::warn!(error = %e, "platform_statistics RPC failed");
+                        Err(e)
+                    }
+                }
             })
             .await?;
 
@@ -405,8 +409,8 @@ impl BlockchainClient {
             .cache
             .get_or_set_json(&key, ttl, || async move {
                 let ledger = self.latest_ledger().await.unwrap_or(0);
-                let data: Value = self
-                    .rpc_call(
+                match self
+                    .rpc_call::<Value>(
                         "getContractData",
                         json!({
                             "contractId": self.contract_id,
@@ -416,52 +420,43 @@ impl BlockchainClient {
                         }),
                     )
                     .await
-                    .unwrap_or_else(|_| json!({"bets": [], "total": 0}));
-
-                let bets = data
-                    .get("bets")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-
-                // The RPC may return a total count; fall back to the slice length
-                // so we never over-report.
-                let total = data
-                    .get("total")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(bets.len() as i64);
-
-                let items = bets
-                    .into_iter()
-                    .map(|entry| UserBet {
-                        market_id: entry
-                            .get("market_id")
+                {
+                    Ok(data) => {
+                        let bets = data
+                            .get("bets")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let total = data
+                            .get("total")
                             .and_then(Value::as_i64)
-                            .unwrap_or_default(),
-                        outcome: entry
-                            .get("outcome")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default() as u32,
-                        amount: entry
-                            .get("amount")
-                            .and_then(Value::as_str)
-                            .unwrap_or("0")
-                            .to_string(),
-                        token: entry
-                            .get("token")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                        ledger,
-                    })
-                    .collect::<Vec<_>>();
-
-                Ok(UserBetsPage {
-                    user: user.to_string(),
-                    page,
-                    page_size,
-                    total,
-                    items,
-                })
+                            .unwrap_or(bets.len() as i64);
+                        let items = bets
+                            .into_iter()
+                            .map(|entry| UserBet {
+                                market_id: entry.get("market_id").and_then(Value::as_i64).unwrap_or_default(),
+                                outcome: entry.get("outcome").and_then(Value::as_u64).unwrap_or_default() as u32,
+                                amount: entry.get("amount").and_then(Value::as_str).unwrap_or("0").to_string(),
+                                token: entry.get("token").and_then(Value::as_str).map(ToOwned::to_owned),
+                                ledger,
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(UserBetsPage {
+                            user: user.to_string(),
+                            page,
+                            page_size,
+                            total,
+                            items,
+                            source: DataSource::Live,
+                        })
+                    }
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getContractData");
+                        self.metrics.observe_rpc_fallback(endpoint);
+                        tracing::warn!(user, error = %e, "user_bets RPC failed");
+                        Err(e)
+                    }
+                }
             })
             .await?;
 
@@ -483,8 +478,8 @@ impl BlockchainClient {
             .cache
             .get_or_set_json(&key, ttl, || async move {
                 let ledger = self.latest_ledger().await.unwrap_or(0);
-                let data: Value = self
-                    .rpc_call(
+                match self
+                    .rpc_call::<Value>(
                         "getContractData",
                         json!({
                             "contractId": self.contract_id,
@@ -492,21 +487,22 @@ impl BlockchainClient {
                         }),
                     )
                     .await
-                    .unwrap_or_else(|_| json!({}));
-
-                Ok(OracleResult {
-                    market_id,
-                    source: data
-                        .get("source")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    outcome: data
-                        .get("outcome")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as u32),
-                    confidence_bps: data.get("confidence_bps").and_then(Value::as_u64),
-                    ledger,
-                })
+                {
+                    Ok(data) => Ok(OracleResult {
+                        market_id,
+                        source_name: data.get("source").and_then(Value::as_str).map(ToOwned::to_owned),
+                        outcome: data.get("outcome").and_then(Value::as_u64).map(|v| v as u32),
+                        confidence_bps: data.get("confidence_bps").and_then(Value::as_u64),
+                        ledger,
+                        source: DataSource::Live,
+                    }),
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getContractData");
+                        self.metrics.observe_rpc_fallback(endpoint);
+                        tracing::warn!(market_id, error = %e, "oracle_result RPC failed");
+                        Err(e)
+                    }
+                }
             })
             .await?;
 
@@ -536,21 +532,24 @@ impl BlockchainClient {
                     error_result_xdr: Option<String>,
                 }
 
-                let tx = self
+                match self
                     .rpc_call::<TxResponse>("getTransaction", json!({ "hash": hash }))
                     .await
-                    .unwrap_or(TxResponse {
-                        status: "NOT_FOUND".to_string(),
-                        ledger: None,
-                        error_result_xdr: None,
-                    });
-
-                Ok(TransactionStatus {
-                    hash: hash.to_string(),
-                    status: tx.status,
-                    ledger: tx.ledger,
-                    error: tx.error_result_xdr,
-                })
+                {
+                    Ok(tx) => Ok(TransactionStatus {
+                        hash: hash.to_string(),
+                        status: tx.status,
+                        ledger: tx.ledger,
+                        error: tx.error_result_xdr,
+                        source: DataSource::Live,
+                    }),
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getTransaction");
+                        self.metrics.observe_rpc_fallback(endpoint);
+                        tracing::warn!(hash, error = %e, "transaction_status RPC failed");
+                        Err(e)
+                    }
+                }
             })
             .await?;
 
@@ -571,8 +570,12 @@ impl BlockchainClient {
         let (value, hit) = self
             .cache
             .get_or_set_json(&key, ttl, || async move {
-                let latest = self.latest_ledger().await.unwrap_or(0);
-                let contract_reachable = self
+                let latest = self.latest_ledger().await.unwrap_or_else(|e| {
+                    self.metrics.observe_rpc_error("getLatestLedger");
+                    tracing::warn!(error = %e, "health_check: getLatestLedger failed");
+                    0
+                });
+                let contract_reachable = match self
                     .rpc_call::<Value>(
                         "getContractData",
                         json!({
@@ -581,7 +584,14 @@ impl BlockchainClient {
                         }),
                     )
                     .await
-                    .is_ok();
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        self.metrics.observe_rpc_error("getContractData");
+                        tracing::warn!(error = %e, "health_check: contract probe failed");
+                        false
+                    }
+                };
 
                 let checked_at_unix = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -643,7 +653,11 @@ impl BlockchainClient {
             let result = self
                 .rpc_call::<EventsResponse>("getEvents", params)
                 .await
-                .unwrap_or(EventsResponse { events: vec![], latest_ledger: None });
+                .map_err(|e| {
+                    self.metrics.observe_rpc_error("getEvents");
+                    tracing::warn!(from_ledger, error = %e, "getEvents RPC failed");
+                    e
+                })?;
 
             let batch_len = result.events.len();
             let last_id = result.events.last()
@@ -693,7 +707,11 @@ impl BlockchainClient {
     }
 
     async fn sync_once(&self, cursor_ledger: u32) -> anyhow::Result<u32> {
-        let latest = self.latest_ledger().await.unwrap_or(cursor_ledger);
+        let latest = self.latest_ledger().await.unwrap_or_else(|e| {
+            self.metrics.observe_rpc_error("getLatestLedger");
+            tracing::warn!(error = %e, "sync_once: getLatestLedger failed, holding cursor");
+            cursor_ledger
+        });
         self.handle_reorg_if_detected(latest).await?;
 
         let confirmed_tip = latest.saturating_sub(self.confirmation_ledger_lag);
@@ -896,5 +914,36 @@ impl BlockchainClient {
             WorkerHandle::new("blockchain-sync", sync_handle),
             WorkerHandle::new("blockchain-tx-monitor", mon_handle),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataSource;
+
+    /// DataSource::Live and StaleFallback must be distinguishable by callers.
+    #[test]
+    fn data_source_variants_are_distinct() {
+        assert_ne!(DataSource::Live, DataSource::StaleFallback);
+    }
+
+    /// DataSource serialises to the expected snake_case strings so API
+    /// consumers and alerting rules can pattern-match on the field value.
+    #[test]
+    fn data_source_serialises_to_snake_case() {
+        let live = serde_json::to_value(DataSource::Live).unwrap();
+        let stale = serde_json::to_value(DataSource::StaleFallback).unwrap();
+        assert_eq!(live, serde_json::json!("live"));
+        assert_eq!(stale, serde_json::json!("stale_fallback"));
+    }
+
+    /// DataSource round-trips through JSON without loss.
+    #[test]
+    fn data_source_round_trips() {
+        for variant in [DataSource::Live, DataSource::StaleFallback] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: DataSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
     }
 }
